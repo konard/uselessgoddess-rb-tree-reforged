@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 
 use anyhow::Result;
+use farm_core::config::FarmConfig;
 use farm_core::farm::{self, FarmModule, SessionId, WorkerEvent};
 use kameo::Actor;
 use kameo::actor::{ActorRef, Spawn};
@@ -10,19 +11,19 @@ use protocol::migo::{ClientType, worker};
 use server::{Server, WorkerId};
 use time_check::mini_check;
 
-/// Runtime configuration for the farm core.
+/// Runtime configuration for the farm core binary.
 pub struct Config {
     /// Bind address for the worker server.
     pub addr: SocketAddr,
-    /// How many sessions must be ready before a party is auto-created.
-    pub party_size: usize,
+    /// Game-level farm configuration (party size, map, timings…).
+    pub farm: FarmConfig,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             addr: SocketAddr::from_str("0.0.0.0:4000").unwrap(),
-            party_size: 4,
+            farm: FarmConfig::default(),
         }
     }
 }
@@ -45,6 +46,7 @@ impl Actor for Core {
         let server = Server::new(addr, recp).await?;
 
         let farm = FarmModule::new(
+            config.farm.clone(),
             actor_ref.clone().recipient(),
             actor_ref.clone().recipient(),
         ).await?;
@@ -117,8 +119,8 @@ impl Core {
 
             farm::Event::SessionReady(sid) => {
                 self.pending_sessions.push(sid);
-                if self.pending_sessions.len() >= self.config.party_size {
-                    let party_size = self.config.party_size;
+                let party_size = self.config.farm.party_size;
+                if self.pending_sessions.len() >= party_size {
                     let sids: Vec<SessionId> =
                         self.pending_sessions.drain(..party_size).collect();
                     let pid = self.farm.create_party().await?;

@@ -9,9 +9,9 @@ use protocol::migo::worker::session::game::{
     self, Map, MatchState, Phase, PlayerState, SignOnState, Team,
 };
 use protocol::migo::worker::session::{self};
-use std::time::Duration;
 use tokio::time::sleep;
 
+use crate::config::FarmConfig;
 use crate::error::Error;
 use crate::prelude::*;
 
@@ -61,7 +61,13 @@ pub struct Member {
     name: Option<String>,
 }
 
-struct Group {
+/// All members of a party play as a single lobby group.
+///
+/// The first member added becomes the `master` (lobby host); the rest are
+/// `slaves` (invited players).  `match_id` is set when the master receives
+/// the match notification and is used to detect cross-group mismatches in
+/// multi-group scenarios (kept for forward compatibility).
+struct LobbyGroup {
     master: SessionId,
     slaves: Vec<SessionId>,
     match_id: Option<u64>,
@@ -69,34 +75,33 @@ struct Group {
 
 pub struct PartyActor {
     pid: PartyId,
+    config: FarmConfig,
     parent: Recipient<(PartyId, Event)>,
     engine: Option<Engine>,
     round: usize,
 
-    group_gen: IdGen<crate::ids::GroupTag>,
-
     // IndexMap preserves insertion order, which guarantees a deterministic
     // master selection (first inserted session = master of the group).
     members: IndexMap<SessionId, Member>,
-    groups: IndexMap<GroupId, Group>,
+    group: Option<LobbyGroup>,
 
     bot_to_session: BiMap<BotId, SessionId>,
 }
 
 impl Actor for PartyActor {
-    type Args = (PartyId, Recipient<(PartyId, Event)>);
+    type Args = (PartyId, FarmConfig, Recipient<(PartyId, Event)>);
     type Error = anyhow::Error;
 
     async fn on_start(args: Self::Args, _: ActorRef<Self>) -> anyhow::Result<Self, anyhow::Error> {
-        let (pid, parent) = args;
+        let (pid, config, parent) = args;
         Ok(Self {
             pid,
+            config,
             parent,
             engine: None,
             round: 0,
-            group_gen: IdGen::default(),
             members: IndexMap::new(),
-            groups: IndexMap::new(),
+            group: None,
             bot_to_session: BiMap::new(),
         })
     }
@@ -142,34 +147,29 @@ impl Message<MemberCreate> for PartyActor {
 impl PartyActor {
     async fn start_party(&mut self, _ctx: &mut Context<Self, crate::error::Result>) -> crate::error::Result {
         let ids: Vec<SessionId> = self.members.keys().cloned().collect();
+        let master = ids[0];
+        let slaves = ids[1..].to_vec();
 
-        let gid = self.group_gen.next();
-        self.groups.insert(
-            gid,
-            Group { master: ids[0], slaves: ids[1..].to_vec(), match_id: None },
-        );
-
-        for (_gid, group) in &self.groups {
-            let master_sid = group.master;
-
-            let mut tasks = vec![MenuTask::Clear];
-            for &slave_sid in &group.slaves {
-                let code = self.members[&slave_sid].friend_code.clone();
-                tasks.push(MenuTask::SendInvite { code });
-                tasks.push(MenuTask::Clear);
-            }
-
-            let total = tasks.len();
-            if let Some(master) = self.members.get_mut(&master_sid) {
-                master.menu_task = Some(InMenuTask { total, next_sync: SyncPoint::Ready });
-            }
-
-            let command = game::Command::BotMenuSetTasks { tasks, offset: 0 };
-            self.send_session(master_sid, session::Command::Game(command)).await?;
-
-            let command = game::Command::BotMenuStart;
-            self.send_session(master_sid, session::Command::Game(command)).await?;
+        let mut tasks = vec![MenuTask::Clear];
+        for &slave_sid in &slaves {
+            let code = self.members[&slave_sid].friend_code.clone();
+            tasks.push(MenuTask::SendInvite { code });
+            tasks.push(MenuTask::Clear);
         }
+
+        let total = tasks.len();
+        if let Some(master_member) = self.members.get_mut(&master) {
+            master_member.menu_task = Some(InMenuTask { total, next_sync: SyncPoint::Ready });
+        }
+
+        self.group = Some(LobbyGroup { master, slaves, match_id: None });
+
+        let command = game::Command::BotMenuSetTasks { tasks, offset: 0 };
+        self.send_session(master, session::Command::Game(command)).await?;
+
+        let command = game::Command::BotMenuStart;
+        self.send_session(master, session::Command::Game(command)).await?;
+
         Ok(())
     }
 
@@ -293,10 +293,10 @@ impl PartyActor {
             }
 
             session::Event::Game(game::Event::MatchReceived { match_id }) => {
-                for (_gid, group) in &mut self.groups {
-                    if sid == group.master {
-                        group.match_id = Some(match_id);
-                    }
+                if let Some(group) = &mut self.group
+                    && sid == group.master
+                {
+                    group.match_id = Some(match_id);
                 }
 
                 member.sync = SyncPoint::RecvMatch;
@@ -309,8 +309,7 @@ impl PartyActor {
                 map: Map::Base { name: map_name },
                 match_state: Some(MatchState { phase: Phase::Round { number }, freeze: false, .. }),
             }) => {
-                const MAP_NAME: &str = "de_vertigo";
-                if map_name == MAP_NAME
+                if map_name == self.config.map
                     && matches!(team, Team::CounterTerrorists | Team::Terrorists)
                     && number as usize == self.round
                 {
@@ -394,26 +393,28 @@ impl PartyActor {
         &mut self,
         _ctx: &mut Context<Self, crate::error::Result>,
     ) -> crate::error::Result {
-        for (_gid, group) in &self.groups {
-            if let Some(master) = self.members.get_mut(&group.master) {
-                master.sync = SyncPoint::Lobby;
+        let slaves = self.group.as_ref().map(|g| g.slaves.clone()).unwrap_or_default();
+
+        // Master's lobby is open — slaves accept the invite.
+        if let Some(group) = &self.group
+            && let Some(master) = self.members.get_mut(&group.master)
+        {
+            master.sync = SyncPoint::Lobby;
+        }
+
+        for slave_sid in slaves {
+            if let Some(slave) = self.members.get_mut(&slave_sid) {
+                slave.menu_task = Some(InMenuTask { total: 2, next_sync: SyncPoint::Lobby });
             }
 
-            for &slave_sid in &group.slaves {
-                if let Some(slave) = self.members.get_mut(&slave_sid) {
-                    slave.menu_task =
-                        Some(InMenuTask { total: 2, next_sync: SyncPoint::Lobby });
-                }
+            let command = session::Command::Game(game::Command::BotMenuSetTasks {
+                tasks: vec![MenuTask::Clear, MenuTask::AcceptInvite],
+                offset: 0,
+            });
+            self.send_session(slave_sid, command).await?;
 
-                let command = session::Command::Game(game::Command::BotMenuSetTasks {
-                    tasks: vec![MenuTask::Clear, MenuTask::AcceptInvite],
-                    offset: 0,
-                });
-                self.send_session(slave_sid, command).await?;
-
-                let command = session::Command::Game(game::Command::BotMenuStart);
-                self.send_session(slave_sid, command).await?;
-            }
+            let command = session::Command::Game(game::Command::BotMenuStart);
+            self.send_session(slave_sid, command).await?;
         }
 
         self.clear_sync();
@@ -424,16 +425,18 @@ impl PartyActor {
         &mut self,
         ctx: &mut Context<Self, crate::error::Result>,
     ) -> crate::error::Result {
-        let match_ids: Vec<_> = self.groups.values().filter_map(|g| g.match_id).collect();
-        if !match_ids.windows(2).all(|w| w[0] == w[1]) {
-            println!("match_id mismatch across groups: {:?}", match_ids);
+        // Verify all groups agreed on the same match (forward-compat check).
+        let match_id = self.group.as_ref().and_then(|g| g.match_id);
+        if match_id.is_none() {
+            println!("on_all_recv_match: no match_id recorded");
             self.clear_sync();
             return Ok(());
         }
 
+        let delay = self.config.accept_match_delay;
         let self_recp = ctx.actor_ref().clone().recipient();
         tokio::spawn(async move {
-            sleep(Duration::from_secs(3)).await;
+            sleep(delay).await;
             let _ = self_recp.tell(Command::AcceptMatchNow).await;
         });
 

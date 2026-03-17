@@ -1,3 +1,4 @@
+pub mod config;
 pub mod error;
 pub mod farm;
 pub mod ids;

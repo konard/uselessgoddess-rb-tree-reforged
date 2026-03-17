@@ -6,14 +6,19 @@ use anyhow::Result;
 use kameo::actor::{ActorRef, Recipient, Spawn};
 use protocol::migo::worker::session;
 
+use crate::config::FarmConfig;
 use crate::ids::{PartyId, SessionId};
 
 #[derive(Debug, Clone)]
 pub struct Party(ActorRef<PartyActor>);
 
 impl Party {
-    pub async fn new(pid: PartyId, parent: Recipient<(PartyId, Event)>) -> Result<Self> {
-        let actor = PartyActor::spawn((pid, parent));
+    pub async fn new(
+        pid: PartyId,
+        config: FarmConfig,
+        parent: Recipient<(PartyId, Event)>,
+    ) -> Result<Self> {
+        let actor = PartyActor::spawn((pid, config, parent));
         Ok(Self(actor))
     }
 

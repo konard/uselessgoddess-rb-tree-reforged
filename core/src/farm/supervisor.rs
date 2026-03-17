@@ -9,26 +9,34 @@ use protocol::migo::worker::session::{self, User, game};
 use server::WorkerId;
 
 use super::party::{self, Party};
+use crate::config::FarmConfig;
 use crate::error::Error;
 use crate::prelude::*;
 
+/// Per-worker state.  Uses a `HashMap` for slot→session so that slot
+/// numbers remain stable even if earlier sessions are removed.
 struct Worker {
-    sessions: Vec<SessionId>,
+    /// Maps the protocol slot index (position in the worker's session list)
+    /// to the logical `SessionId`.
+    slots: HashMap<usize, SessionId>,
+    next_slot: usize,
 }
 
 impl Worker {
     fn new() -> Self {
-        Self { sessions: Vec::new() }
+        Self { slots: HashMap::new(), next_slot: 0 }
     }
 
+    /// Allocate the next slot for a new session and return the slot index.
     fn alloc(&mut self, sid: SessionId) -> usize {
-        let slot = self.sessions.len();
-        self.sessions.push(sid);
+        let slot = self.next_slot;
+        self.next_slot += 1;
+        self.slots.insert(slot, sid);
         slot
     }
 
     fn lookup(&self, slot: usize) -> Option<SessionId> {
-        self.sessions.get(slot).copied()
+        self.slots.get(&slot).copied()
     }
 }
 
@@ -81,7 +89,12 @@ pub enum Command {
 /// party logic.  It maintains the authoritative maps of
 /// workers → sessions and sessions → parties, and routes every
 /// incoming worker event or outgoing session command to the right place.
+///
+/// Game-specific behaviour (map name, timing, party size) is captured in
+/// `FarmConfig` and forwarded to every `Party` that is spawned so that the
+/// routing layer stays policy-free.
 pub struct Ratchet {
+    config: FarmConfig,
     parent: Recipient<Event>,
     server: Recipient<(WorkerId, worker::Command)>,
 
@@ -94,12 +107,13 @@ pub struct Ratchet {
 }
 
 impl Actor for Ratchet {
-    type Args = (Recipient<(WorkerId, worker::Command)>, Recipient<Event>);
+    type Args = (FarmConfig, Recipient<(WorkerId, worker::Command)>, Recipient<Event>);
     type Error = anyhow::Error;
 
     async fn on_start(args: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        let (server, parent) = args;
+        let (config, server, parent) = args;
         Ok(Self {
+            config,
             parent,
             server,
             session_gen: IdGen::default(),
@@ -216,7 +230,7 @@ impl Message<PartyCreate> for Ratchet {
         let pid = self.party_gen.next();
         let recp = ctx.actor_ref().clone().recipient();
 
-        let party = Party::new(pid, recp).await.map_err(Error::from)?;
+        let party = Party::new(pid, self.config.clone(), recp).await.map_err(Error::from)?;
         self.parties.insert(pid, party);
 
         Ok(pid)

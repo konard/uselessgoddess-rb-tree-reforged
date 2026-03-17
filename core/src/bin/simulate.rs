@@ -1,4 +1,5 @@
 use anyhow::Result;
+use farm_core::config::FarmConfig;
 use farm_core::farm::{self, FarmModule, SessionId};
 use kameo::actor::{ActorRef, Spawn};
 use kameo::prelude::{Context, Message};
@@ -103,7 +104,7 @@ async fn main() -> Result<()> {
         FarmLog::spawn(()).recipient()
     };
 
-    let farm = FarmModule::new(server_recp, farm_recp).await?;
+    let farm = FarmModule::new(FarmConfig::default(), server_recp, farm_recp).await?;
 
     let wid = WorkerId(1);
     farm.worker_connected(wid).await?;

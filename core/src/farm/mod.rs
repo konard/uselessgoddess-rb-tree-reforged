@@ -9,15 +9,18 @@ pub use crate::ids::{PartyId, SessionId};
 use protocol::migo::worker;
 use server::WorkerId;
 
+use crate::config::FarmConfig;
+
 #[derive(Debug, Clone)]
 pub struct FarmModule(ActorRef<Ratchet>);
 
 impl FarmModule {
     pub async fn new(
+        config: FarmConfig,
         server: Recipient<(WorkerId, worker::Command)>,
         parent: Recipient<Event>,
     ) -> Result<Self> {
-        let actor = Ratchet::spawn((server, parent));
+        let actor = Ratchet::spawn((config, server, parent));
         Ok(Self(actor))
     }
 
