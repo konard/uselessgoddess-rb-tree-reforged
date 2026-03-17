@@ -5,7 +5,7 @@ use kameo::actor::Recipient;
 use protocol::migo::{ClientType, worker};
 
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
-pub struct WorkerId(pub u32);
+pub struct WorkerId(pub u64);
 
 #[derive(Debug)]
 pub enum Event {

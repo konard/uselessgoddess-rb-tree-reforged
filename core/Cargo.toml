@@ -3,14 +3,22 @@ name    = "core"
 version = "0.1.0"
 edition.workspace = true
 
+[lib]
+name = "farm_core"
+
 [dependencies]
 anyhow     = { workspace = true }
 kameo      = { workspace = true }
 tokio      = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "sync", "signal", "time"] }
 bimap      = "0.6"
+indexmap   = "2"
 rand       = "0.8"
 
 time-check  = { path = "../stubs/time-check" }
 server      = { path = "../stubs/server" }
 protocol    = { path = "../stubs/protocol" }
 path-engine = { path = "../stubs/path-engine" }
+
+[[bin]]
+name = "simulate"
+path = "src/bin/simulate.rs"

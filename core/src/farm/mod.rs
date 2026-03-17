@@ -1,27 +1,27 @@
-mod actor;
 mod party;
+mod supervisor;
 
-use actor::{Command, FarmModuleActor, PartyCommand, PartyCreate, SessionCreate};
-pub use actor::{Event, SessionEvent, SessionId, SessionState, WorkerEvent};
+use supervisor::{Command, FarmSupervisor, PartyCommand, PartyCreate, SessionCreate};
+pub use supervisor::{Event, WorkerEvent};
 use anyhow::Result;
 use kameo::actor::{ActorRef, Recipient, Spawn};
-pub use party::PartyId;
+pub use crate::ids::{PartyId, SessionId};
 use protocol::migo::worker;
 use server::WorkerId;
 
 #[derive(Debug, Clone)]
-pub struct FarmModule(ActorRef<FarmModuleActor>);
+pub struct FarmModule(ActorRef<FarmSupervisor>);
 
 impl FarmModule {
     pub async fn new(
         server: Recipient<(WorkerId, worker::Command)>,
         parent: Recipient<Event>,
     ) -> Result<Self> {
-        let actor = FarmModuleActor::spawn((server, parent));
+        let actor = FarmSupervisor::spawn((server, parent));
         Ok(Self(actor))
     }
 
-    pub fn actor(&self) -> &ActorRef<FarmModuleActor> {
+    pub fn actor(&self) -> &ActorRef<FarmSupervisor> {
         &self.0
     }
 
@@ -56,12 +56,12 @@ impl FarmModule {
     }
 
     pub async fn party_add(&self, pid: &PartyId, sid: &SessionId) -> Result<()> {
-        let cmd = Command::Party(pid.clone(), PartyCommand::Add(sid.clone()));
+        let cmd = Command::Party(*pid, PartyCommand::Add(*sid));
         Ok(self.actor().ask(cmd).await?)
     }
 
     pub async fn party_start(&self, pid: &PartyId) -> Result<()> {
-        let cmd = Command::Party(pid.clone(), PartyCommand::Start);
+        let cmd = Command::Party(*pid, PartyCommand::Start);
         Ok(self.actor().ask(cmd).await?)
     }
 }
