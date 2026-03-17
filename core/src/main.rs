@@ -105,10 +105,10 @@ impl Core {
                     let sids: Vec<SessionId> =
                         self.pending_sessions.drain(..PARTY_SIZE).collect();
                     let pid = self.farm.create_party().await?;
-                    for s in &sids {
-                        self.farm.party_add(&pid, s).await?;
+                    for s in sids {
+                        self.farm.party_add(pid, s).await?;
                     }
-                    self.farm.party_start(&pid).await?;
+                    self.farm.party_start(pid).await?;
                 }
             }
 

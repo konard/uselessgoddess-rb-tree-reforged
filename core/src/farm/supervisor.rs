@@ -12,8 +12,24 @@ use super::party::{self, Party};
 use crate::ids::{IdGen, PartyId, SessionId};
 
 struct Worker {
-    next_slot: usize,
-    slot_to_session: HashMap<usize, SessionId>,
+    sessions: Vec<SessionId>,
+}
+
+impl Worker {
+    fn new() -> Self {
+        Self { sessions: Vec::new() }
+    }
+
+    fn alloc(&mut self, sid: SessionId) -> usize {
+        let slot = self.sessions.len();
+        self.sessions.push(sid);
+        slot
+    }
+
+    fn lookup(&self, slot: usize) -> Option<SessionId> {
+        self.sessions.get(slot).copied()
+    }
+
 }
 
 pub struct SessionCreate {
@@ -26,7 +42,7 @@ pub struct SessionCreate {
 pub struct PartyCreate {}
 
 struct SessionRecord {
-    worker_id: WorkerId,
+    wid: WorkerId,
     slot: usize,
     party_id: Option<PartyId>,
     friend_code: Option<String>,
@@ -59,7 +75,7 @@ pub enum Command {
     Party(PartyId, PartyCommand),
 }
 
-pub struct FarmSupervisor {
+pub struct Ratchet {
     parent: Recipient<Event>,
     server: Recipient<(WorkerId, worker::Command)>,
 
@@ -71,7 +87,7 @@ pub struct FarmSupervisor {
     sessions: HashMap<SessionId, SessionRecord>,
 }
 
-impl Actor for FarmSupervisor {
+impl Actor for Ratchet {
     type Args = (Recipient<(WorkerId, worker::Command)>, Recipient<Event>);
     type Error = anyhow::Error;
 
@@ -89,52 +105,44 @@ impl Actor for FarmSupervisor {
     }
 }
 
-impl Message<(PartyId, party::Event)> for FarmSupervisor {
+impl Message<(PartyId, party::Event)> for Ratchet {
     type Reply = ();
 
     async fn handle(
         &mut self,
-        event: (PartyId, party::Event),
+        (pid, event): (PartyId, party::Event),
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        if let Err(e) = self.handle_party(event).await {
+        let result = match event {
+            party::Event::Session(sid, cmd) => {
+                self.sessions
+                    .get(&sid)
+                    .ok_or_else(|| anyhow::anyhow!("session {sid:?} not found"))
+                    .and_then(|rec| {
+                        let command = worker::Command::Session(rec.slot, cmd);
+                        self.server.tell((rec.wid, command)).try_send()?;
+                        Ok(())
+                    })
+            }
+            party::Event::RoundComplete => self.parent.tell(Event::PartyRound(pid)).await.map_err(Into::into),
+            party::Event::Done => {
+                self.parties.remove(&pid);
+                self.parent.tell(Event::PartyDone(pid)).await.map_err(Into::into)
+            }
+        };
+        if let Err(e) = result {
             eprintln!("Err: {}", e);
         }
     }
 }
 
-impl FarmSupervisor {
-    async fn handle_party(&mut self, (pid, event): (PartyId, party::Event)) -> Result<()> {
-        match event {
-            party::Event::Session(sid, cmd) => self.route_cmd(sid, cmd)?,
-            party::Event::RoundComplete => {
-                self.parent.tell(Event::PartyRound(pid)).await?;
-            }
-            party::Event::Done => {
-                self.parties.remove(&pid);
-                self.parent.tell(Event::PartyDone(pid)).await?;
-            }
-        }
-        Ok(())
-    }
-
-    fn route_cmd(&self, sid: SessionId, cmd: session::Command) -> Result<()> {
-        let rec =
-            self.sessions.get(&sid).ok_or_else(|| anyhow::anyhow!("session {sid:?} not found"))?;
-        let command = worker::Command::Session(rec.slot, cmd);
-        self.server.tell((rec.worker_id, command)).try_send()?;
-        Ok(())
-    }
-}
-
-impl Message<Command> for FarmSupervisor {
+impl Message<Command> for Ratchet {
     type Reply = Result<()>;
 
     async fn handle(&mut self, cmd: Command, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         match cmd {
             Command::Connected(wid) => {
-                self.workers
-                    .insert(wid, Worker { next_slot: 0, slot_to_session: HashMap::new() });
+                self.workers.insert(wid, Worker::new());
                 self.parent.tell(Event::Worker(wid, WorkerEvent::New)).await?;
             }
 
@@ -142,7 +150,7 @@ impl Message<Command> for FarmSupervisor {
                 let Some(worker) = self.workers.get(&wid) else {
                     bail!("Worker {:?} not found", wid);
                 };
-                let Some(&sid) = worker.slot_to_session.get(&slot) else {
+                let Some(sid) = worker.lookup(slot) else {
                     bail!("Slot {} not found for worker {:?}", slot, wid);
                 };
                 self.handle_session(sid, ev, ctx).await?;
@@ -176,7 +184,7 @@ impl Message<Command> for FarmSupervisor {
     }
 }
 
-impl Message<SessionCreate> for FarmSupervisor {
+impl Message<SessionCreate> for Ratchet {
     type Reply = Result<SessionId>;
 
     async fn handle(
@@ -188,14 +196,11 @@ impl Message<SessionCreate> for FarmSupervisor {
             bail!("Worker {:?} not found", wid);
         };
 
-        let slot = worker.next_slot;
-        worker.next_slot += 1;
-
         let sid = self.session_gen.next();
-        worker.slot_to_session.insert(slot, sid);
+        let slot = worker.alloc(sid);
 
         let user = User { username, password, secret };
-        self.sessions.insert(sid, SessionRecord { worker_id: wid, slot, party_id: None, friend_code: None });
+        self.sessions.insert(sid, SessionRecord { wid, slot, party_id: None, friend_code: None });
 
         let command = worker::Command::Session(slot, session::Command::Create { user });
         self.server.tell((wid, command)).try_send()?;
@@ -204,7 +209,7 @@ impl Message<SessionCreate> for FarmSupervisor {
     }
 }
 
-impl Message<PartyCreate> for FarmSupervisor {
+impl Message<PartyCreate> for Ratchet {
     type Reply = Result<PartyId>;
 
     async fn handle(
@@ -222,7 +227,7 @@ impl Message<PartyCreate> for FarmSupervisor {
     }
 }
 
-impl FarmSupervisor {
+impl Ratchet {
     async fn handle_session(
         &mut self,
         sid: SessionId,
@@ -261,7 +266,7 @@ impl FarmSupervisor {
         let dead: Vec<SessionId> = self
             .sessions
             .iter()
-            .filter(|(_, s)| s.worker_id == wid)
+            .filter(|(_, s)| s.wid == wid)
             .map(|(id, _)| *id)
             .collect();
         for sid in dead {
@@ -272,12 +277,11 @@ impl FarmSupervisor {
     }
 
     pub async fn on_session_dead(&mut self, sid: SessionId) -> Result<()> {
-        if let Some(rec) = self.sessions.get(&sid) {
-            if let Some(pid) = rec.party_id {
-                if let Some(party) = self.parties.get(&pid) {
-                    let _ = party.member_dead(sid).await;
-                }
-            }
+        if let Some(rec) = self.sessions.get(&sid)
+            && let Some(pid) = rec.party_id
+            && let Some(party) = self.parties.get(&pid)
+        {
+            let _ = party.member_dead(sid).await;
         }
         self.sessions.remove(&sid);
         self.parent.tell(Event::SessionDead(sid)).await?;

@@ -112,7 +112,7 @@ async fn main() -> Result<()> {
 
     let mut sessions: Vec<SimSession> = Vec::new();
     for i in 0..4usize {
-        let sid = farm.create_session(&wid, &format!("player{i}"), "pass", "secret").await?;
+        let sid = farm.create_session(wid, &format!("player{i}"), "pass", "secret").await?;
         println!("[sim] session {sid:?} created");
         let s = SimSession { sid, wid, farm: farm.clone() };
         s.fire_running().await?;
@@ -127,9 +127,9 @@ async fn main() -> Result<()> {
     println!("[sim] party {pid:?} created");
 
     for s in &sessions {
-        farm.party_add(&pid, &s.sid).await?;
+        farm.party_add(pid, s.sid).await?;
     }
-    farm.party_start(&pid).await?;
+    farm.party_start(pid).await?;
     println!("[sim] party started");
 
     sleep(Duration::from_millis(50)).await;
