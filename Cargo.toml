@@ -1,0 +1,11 @@
+[workspace]
+members = ["core", "stubs/time-check", "stubs/protocol", "stubs/server", "stubs/path-engine"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+
+[workspace.dependencies]
+anyhow  = "1"
+kameo   = "0.19"
+tokio   = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "fs"] }
