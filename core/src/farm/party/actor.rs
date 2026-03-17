@@ -1,106 +1,164 @@
+use std::sync::Arc;
+use std::time::Duration;
+
 use bimap::BiMap;
 use indexmap::IndexMap;
+use slotmap::SlotMap;
 use kameo::Actor;
 use kameo::actor::{ActorRef, Recipient};
 use kameo::prelude::{Context, Message};
-use path_engine::engine::{self, BotEvent, BotId, CBotEvent, Engine};
+use path_engine::engine::{self, BotEvent, BotId, CBotEvent, Engine, PathEngine};
 use protocol::migo::worker::session::game::menu_task::MenuTask;
 use protocol::migo::worker::session::game::{
     self, Map, MatchState, Phase, PlayerState, SignOnState, Team,
 };
 use protocol::migo::worker::session::{self};
-use std::time::Duration;
 use tokio::time::sleep;
 
 use crate::error::Error;
+use crate::farm::layout::PartyLayout;
 use crate::prelude::*;
 
+// ---------------------------------------------------------------------------
+// Public messages
+// ---------------------------------------------------------------------------
+
 pub struct MemberCreate {
-    pub sid: SessionId,
+    pub sid: SessionKey,
     pub friend_code: String,
 }
 
 #[derive(Debug)]
 pub enum Command {
-    Member(SessionId, session::Event),
-    MemberDead(SessionId),
+    Member(SessionKey, session::Event),
+    MemberDead(SessionKey),
     Start,
     AcceptMatchNow,
 }
 
 #[derive(Debug)]
 pub enum Event {
-    Session(SessionId, session::Command),
+    Session(SessionKey, session::Command),
     RoundComplete,
     Done,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-enum SyncPoint {
+// ---------------------------------------------------------------------------
+// Party phase — explicit state machine replacing SyncPoint + sync_epoch
+//
+// Each variant represents a collective state: the party only transitions
+// when *all* members have reached the required individual state.
+// Transitions:
+//
+//   Forming ──start()──► Inviting ──all invited──► Lobby
+//   Lobby ──all recv match──► MatchPending ──3 s──► Accepting
+//   Accepting ──all accepted──► GameReady ──engine starts──► InGame
+//   InGame ──engine stops──► Forming  (next round)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+enum MemberPhase {
+    /// Waiting for their individual sync event.
     Waiting,
-    Ready,
+    /// Member has received a lobby invite (slave only; master skips to Lobby).
+    InviteReceived,
+    /// Member is in the lobby.
     Lobby,
-    RecvMatch,
-    GameLoading,
-    GameReady,
+    /// Member has received the match token.
+    MatchReceived,
+    /// Member is fully loaded in the game map.
+    InGame,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum PartyPhase {
+    /// Party not yet started; collecting members.
+    Forming,
+    /// Master is sending invites; slaves are waiting.
+    Inviting,
+    /// All members are in the lobby; waiting for match.
+    InLobby,
+    /// Match token received; waiting for all members then accepting.
+    MatchPending { match_id: u64 },
+    /// Accept-match menu task dispatched to all members.
+    Accepting,
+    /// All members loaded in the game; engine is running.
+    InGame,
+}
+
+// ---------------------------------------------------------------------------
+// Member & Group records
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone)]
-pub struct InMenuTask {
+struct MenuTaskInfo {
+    /// Total number of tasks in the current batch.
     total: usize,
-    next_sync: SyncPoint,
+    /// Phase to advance to once the final task completes.
+    on_done: MemberPhase,
 }
 
 #[derive(Debug, Clone)]
-pub struct Member {
-    sync_epoch: u32,
-    sync: SyncPoint,
-    menu_task: Option<InMenuTask>,
+struct Member {
+    phase: MemberPhase,
+    menu_task: Option<MenuTaskInfo>,
     friend_code: String,
     team: Option<Team>,
     name: Option<String>,
 }
 
 struct Group {
-    master: SessionId,
-    slaves: Vec<SessionId>,
+    master: SessionKey,
+    slaves: Vec<SessionKey>,
     match_id: Option<u64>,
 }
 
-pub struct PartyActor {
-    pid: PartyId,
-    parent: Recipient<(PartyId, Event)>,
-    engine: Option<Engine>,
-    round: usize,
+// ---------------------------------------------------------------------------
+// PartyActor
+// ---------------------------------------------------------------------------
 
-    group_gen: IdGen<crate::ids::GroupTag>,
+pub struct PartyActor {
+    pid: PartyKey,
+    layout: PartyLayout,
+    parent: Recipient<(PartyKey, Event)>,
+    engine: Option<Arc<dyn PathEngine>>,
+    round: usize,
+    party_phase: PartyPhase,
 
     // IndexMap preserves insertion order, which guarantees a deterministic
     // master selection (first inserted session = master of the group).
-    members: IndexMap<SessionId, Member>,
-    groups: IndexMap<GroupId, Group>,
+    members: IndexMap<SessionKey, Member>,
+    groups: SlotMap<GroupKey, Group>,
 
-    bot_to_session: BiMap<BotId, SessionId>,
+    bot_to_session: BiMap<BotId, SessionKey>,
 }
 
 impl Actor for PartyActor {
-    type Args = (PartyId, Recipient<(PartyId, Event)>);
+    type Args = (PartyKey, PartyLayout, Recipient<(PartyKey, Event)>);
     type Error = anyhow::Error;
 
-    async fn on_start(args: Self::Args, _: ActorRef<Self>) -> anyhow::Result<Self, anyhow::Error> {
-        let (pid, parent) = args;
+    async fn on_start(
+        args: Self::Args,
+        _: ActorRef<Self>,
+    ) -> anyhow::Result<Self, anyhow::Error> {
+        let (pid, layout, parent) = args;
         Ok(Self {
             pid,
+            layout,
             parent,
             engine: None,
             round: 0,
-            group_gen: IdGen::default(),
+            party_phase: PartyPhase::Forming,
             members: IndexMap::new(),
-            groups: IndexMap::new(),
+            groups: SlotMap::with_key(),
             bot_to_session: BiMap::new(),
         })
     }
 }
+
+// ---------------------------------------------------------------------------
+// Message handlers
+// ---------------------------------------------------------------------------
 
 impl Message<Command> for PartyActor {
     type Reply = crate::error::Result;
@@ -127,74 +185,13 @@ impl Message<MemberCreate> for PartyActor {
         _: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let member = Member {
-            sync_epoch: 0,
-            sync: SyncPoint::Waiting,
+            phase: MemberPhase::Waiting,
             menu_task: None,
             friend_code,
             team: None,
             name: None,
         };
         self.members.insert(sid, member);
-        Ok(())
-    }
-}
-
-impl PartyActor {
-    async fn start_party(&mut self, _ctx: &mut Context<Self, crate::error::Result>) -> crate::error::Result {
-        let ids: Vec<SessionId> = self.members.keys().cloned().collect();
-
-        let gid = self.group_gen.next();
-        self.groups.insert(
-            gid,
-            Group { master: ids[0], slaves: ids[1..].to_vec(), match_id: None },
-        );
-
-        for (_gid, group) in &self.groups {
-            let master_sid = group.master;
-
-            let mut tasks = vec![MenuTask::Clear];
-            for &slave_sid in &group.slaves {
-                let code = self.members[&slave_sid].friend_code.clone();
-                tasks.push(MenuTask::SendInvite { code });
-                tasks.push(MenuTask::Clear);
-            }
-
-            let total = tasks.len();
-            if let Some(master) = self.members.get_mut(&master_sid) {
-                master.menu_task = Some(InMenuTask { total, next_sync: SyncPoint::Ready });
-            }
-
-            let command = game::Command::BotMenuSetTasks { tasks, offset: 0 };
-            self.send_session(master_sid, session::Command::Game(command)).await?;
-
-            let command = game::Command::BotMenuStart;
-            self.send_session(master_sid, session::Command::Game(command)).await?;
-        }
-        Ok(())
-    }
-
-    async fn send_accept_match(
-        &mut self,
-        _ctx: &mut Context<Self, crate::error::Result>,
-    ) -> crate::error::Result {
-        let accept_task = InMenuTask { total: 1, next_sync: SyncPoint::GameLoading };
-        for member in self.members.values_mut() {
-            member.menu_task = Some(accept_task.clone());
-        }
-
-        let sids: Vec<SessionId> = self.members.keys().cloned().collect();
-        for sid in sids {
-            let command = session::Command::Game(game::Command::BotMenuSetTasks {
-                tasks: vec![MenuTask::AcceptMatch],
-                offset: 0,
-            });
-            self.send_session(sid, command).await?;
-
-            let command = session::Command::Game(game::Command::BotMenuStart);
-            self.send_session(sid, command).await?;
-        }
-
-        self.clear_sync();
         Ok(())
     }
 }
@@ -213,7 +210,77 @@ impl Message<engine::Event> for PartyActor {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Party lifecycle helpers
+// ---------------------------------------------------------------------------
+
 impl PartyActor {
+    async fn start_party(
+        &mut self,
+        _ctx: &mut Context<Self, crate::error::Result>,
+    ) -> crate::error::Result {
+        let ids: Vec<SessionKey> = self.members.keys().cloned().collect();
+
+        // Build a single group from all members (master = first inserted).
+        let _gid = self.groups.insert_with_key(|_key| Group {
+            master: ids[0],
+            slaves: ids[1..].to_vec(),
+            match_id: None,
+        });
+
+        self.party_phase = PartyPhase::Inviting;
+
+        for (_gid, group) in &self.groups {
+            let master_sid = group.master;
+
+            let mut tasks = vec![MenuTask::Clear];
+            for &slave_sid in &group.slaves {
+                let code = self.members[&slave_sid].friend_code.clone();
+                tasks.push(MenuTask::SendInvite { code });
+                tasks.push(MenuTask::Clear);
+            }
+
+            let total = tasks.len();
+            if let Some(master) = self.members.get_mut(&master_sid) {
+                master.menu_task =
+                    Some(MenuTaskInfo { total, on_done: MemberPhase::Lobby });
+            }
+
+            let command = game::Command::BotMenuSetTasks { tasks, offset: 0 };
+            self.send_session(master_sid, session::Command::Game(command)).await?;
+
+            let command = game::Command::BotMenuStart;
+            self.send_session(master_sid, session::Command::Game(command)).await?;
+        }
+        Ok(())
+    }
+
+    async fn send_accept_match(
+        &mut self,
+        _ctx: &mut Context<Self, crate::error::Result>,
+    ) -> crate::error::Result {
+        self.party_phase = PartyPhase::Accepting;
+
+        let accept_task = MenuTaskInfo { total: 1, on_done: MemberPhase::InGame };
+        for member in self.members.values_mut() {
+            member.menu_task = Some(accept_task.clone());
+            member.phase = MemberPhase::Waiting;
+        }
+
+        let sids: Vec<SessionKey> = self.members.keys().cloned().collect();
+        for sid in sids {
+            let command = session::Command::Game(game::Command::BotMenuSetTasks {
+                tasks: vec![MenuTask::AcceptMatch],
+                offset: 0,
+            });
+            self.send_session(sid, command).await?;
+
+            let command = session::Command::Game(game::Command::BotMenuStart);
+            self.send_session(sid, command).await?;
+        }
+        Ok(())
+    }
+
     async fn handle_engine(
         &mut self,
         event: engine::Event,
@@ -227,6 +294,7 @@ impl PartyActor {
             engine::Event::Stop => {
                 self.bot_to_session.clear();
                 self.engine = None;
+                self.party_phase = PartyPhase::Forming;
                 self.send_event(Event::Done).await?;
             }
         }
@@ -240,7 +308,7 @@ impl PartyActor {
             .map_err(|e| Error::Send(e.into()))
     }
 
-    async fn send_session(&self, sid: SessionId, cmd: session::Command) -> crate::error::Result {
+    async fn send_session(&self, sid: SessionKey, cmd: session::Command) -> crate::error::Result {
         self.send_event(Event::Session(sid, cmd)).await
     }
 
@@ -278,9 +346,13 @@ impl PartyActor {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // Member event handler + phase transitions
+    // -----------------------------------------------------------------------
+
     async fn handle_member(
         &mut self,
-        sid: SessionId,
+        sid: SessionKey,
         event: session::Event,
         ctx: &mut Context<Self, crate::error::Result>,
     ) -> crate::error::Result {
@@ -288,8 +360,8 @@ impl PartyActor {
 
         match event {
             session::Event::Game(game::Event::InviteReceived) => {
-                member.sync = SyncPoint::Ready;
-                self.sync_update(ctx).await?;
+                member.phase = MemberPhase::InviteReceived;
+                self.check_phase_transitions(ctx).await?;
             }
 
             session::Event::Game(game::Event::MatchReceived { match_id }) => {
@@ -299,8 +371,9 @@ impl PartyActor {
                     }
                 }
 
-                member.sync = SyncPoint::RecvMatch;
-                self.sync_update(ctx).await?;
+                let member = self.members.get_mut(&sid).ok_or(Error::SessionNotFound(sid))?;
+                member.phase = MemberPhase::MatchReceived;
+                self.check_phase_transitions(ctx).await?;
             }
 
             session::Event::Game(game::Event::StateUpdate {
@@ -309,15 +382,17 @@ impl PartyActor {
                 map: Map::Base { name: map_name },
                 match_state: Some(MatchState { phase: Phase::Round { number }, freeze: false, .. }),
             }) => {
-                const MAP_NAME: &str = "de_vertigo";
-                if map_name == MAP_NAME
+                // Dynamic map name from PartyLayout — no hardcoded constant.
+                if map_name == self.layout.map
                     && matches!(team, Team::CounterTerrorists | Team::Terrorists)
                     && number as usize == self.round
                 {
+                    let member =
+                        self.members.get_mut(&sid).ok_or(Error::SessionNotFound(sid))?;
                     member.name = Some(name);
                     member.team = Some(team);
-                    member.sync = SyncPoint::GameReady;
-                    self.sync_update(ctx).await?;
+                    member.phase = MemberPhase::InGame;
+                    self.check_phase_transitions(ctx).await?;
                 }
             }
 
@@ -332,6 +407,7 @@ impl PartyActor {
             }
 
             session::Event::Game(game::Event::MenuTaskCompleted { id }) => {
+                let member = self.members.get_mut(&sid).ok_or(Error::SessionNotFound(sid))?;
                 let Some(task) = &member.menu_task else {
                     return Ok(());
                 };
@@ -340,16 +416,13 @@ impl PartyActor {
                     return Ok(());
                 }
 
-                let Some(task) = member.menu_task.take() else {
-                    return Ok(());
-                };
-
-                member.sync = task.next_sync;
+                let task = member.menu_task.take().unwrap();
+                member.phase = task.on_done;
 
                 let command = session::Command::Game(game::Command::BotMenuStop);
                 self.send_session(sid, command).await?;
 
-                self.sync_update(ctx).await?;
+                self.check_phase_transitions(ctx).await?;
             }
 
             _ => {}
@@ -357,52 +430,76 @@ impl PartyActor {
         Ok(())
     }
 
-    fn clear_sync(&mut self) {
-        for member in self.members.values_mut() {
-            member.sync_epoch += 1;
-            member.sync = SyncPoint::Waiting;
-        }
+    // -----------------------------------------------------------------------
+    // Phase transition logic (replaces sync_epoch + all_at)
+    // -----------------------------------------------------------------------
+
+    fn all_members_at(&self, phase: &MemberPhase) -> bool {
+        !self.members.is_empty() && self.members.values().all(|m| &m.phase == phase)
     }
 
-    fn current_epoch(&self) -> u32 {
-        self.members.values().map(|m| m.sync_epoch).max().unwrap_or(0)
-    }
-
-    fn all_at(&self, epoch: u32, point: &SyncPoint) -> bool {
-        self.members.values().all(|m| m.sync_epoch == epoch && &m.sync == point)
-    }
-
-    async fn sync_update(
+    async fn check_phase_transitions(
         &mut self,
         ctx: &mut Context<Self, crate::error::Result>,
     ) -> crate::error::Result {
-        let epoch = self.current_epoch();
+        match &self.party_phase.clone() {
+            PartyPhase::Inviting => {
+                // All slaves received their invite → master advances to Lobby,
+                // slaves run accept-invite task.
+                let all_invited = {
+                    let groups: Vec<_> = self.groups.values().collect();
+                    groups.iter().all(|g| {
+                        g.slaves.iter().all(|s| {
+                            self.members
+                                .get(s)
+                                .map(|m| m.phase == MemberPhase::InviteReceived)
+                                .unwrap_or(false)
+                        })
+                    })
+                };
 
-        if self.all_at(epoch, &SyncPoint::Ready) {
-            return self.on_all_ready(ctx).await;
-        }
-        if self.all_at(epoch, &SyncPoint::RecvMatch) {
-            return self.on_all_recv_match(ctx).await;
-        }
-        if self.all_at(epoch, &SyncPoint::GameReady) {
-            return self.on_all_game_ready(ctx).await;
+                if all_invited {
+                    self.on_all_invited(ctx).await?;
+                }
+            }
+
+            PartyPhase::InLobby => {
+                if self.all_members_at(&MemberPhase::MatchReceived) {
+                    self.on_all_recv_match(ctx).await?;
+                }
+            }
+
+            PartyPhase::Accepting => {
+                // Members transition to InGame phase when their menu task
+                // completes with on_done = InGame.
+                // The actual engine start happens here.
+                if self.all_members_at(&MemberPhase::InGame) {
+                    self.on_all_game_ready(ctx).await?;
+                }
+            }
+
+            _ => {}
         }
         Ok(())
     }
 
-    async fn on_all_ready(
+    async fn on_all_invited(
         &mut self,
         _ctx: &mut Context<Self, crate::error::Result>,
     ) -> crate::error::Result {
+        self.party_phase = PartyPhase::InLobby;
+
         for (_gid, group) in &self.groups {
+            // Master is already in the lobby; just reset its phase.
             if let Some(master) = self.members.get_mut(&group.master) {
-                master.sync = SyncPoint::Lobby;
+                master.phase = MemberPhase::Lobby;
             }
 
             for &slave_sid in &group.slaves {
                 if let Some(slave) = self.members.get_mut(&slave_sid) {
+                    slave.phase = MemberPhase::Waiting;
                     slave.menu_task =
-                        Some(InMenuTask { total: 2, next_sync: SyncPoint::Lobby });
+                        Some(MenuTaskInfo { total: 2, on_done: MemberPhase::Lobby });
                 }
 
                 let command = session::Command::Game(game::Command::BotMenuSetTasks {
@@ -415,8 +512,6 @@ impl PartyActor {
                 self.send_session(slave_sid, command).await?;
             }
         }
-
-        self.clear_sync();
         Ok(())
     }
 
@@ -427,9 +522,14 @@ impl PartyActor {
         let match_ids: Vec<_> = self.groups.values().filter_map(|g| g.match_id).collect();
         if !match_ids.windows(2).all(|w| w[0] == w[1]) {
             println!("match_id mismatch across groups: {:?}", match_ids);
-            self.clear_sync();
+            // Reset members to lobby phase and try again.
+            for m in self.members.values_mut() {
+                m.phase = MemberPhase::Lobby;
+            }
             return Ok(());
         }
+
+        self.party_phase = PartyPhase::MatchPending { match_id: match_ids[0] };
 
         let self_recp = ctx.actor_ref().clone().recipient();
         tokio::spawn(async move {
@@ -445,9 +545,11 @@ impl PartyActor {
         ctx: &mut Context<Self, crate::error::Result>,
     ) -> crate::error::Result {
         self.round += 1;
+        self.party_phase = PartyPhase::InGame;
 
         let recp = ctx.actor_ref().clone().recipient();
-        let engine = Engine::new(recp).await.map_err(Error::from)?;
+        let engine: Arc<dyn PathEngine> =
+            Arc::new(Engine::new(recp).await.map_err(Error::from)?);
 
         for (sid, member) in self.members.iter_mut() {
             let (Some(team), Some(name)) = (&member.team, &member.name) else {
@@ -463,7 +565,11 @@ impl PartyActor {
         engine.start().await.map_err(Error::from)?;
         self.engine = Some(engine);
 
-        self.clear_sync();
+        // Reset member phases for future rounds.
+        for m in self.members.values_mut() {
+            m.phase = MemberPhase::Waiting;
+        }
+
         self.send_event(Event::RoundComplete).await?;
         Ok(())
     }

@@ -2,7 +2,11 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 
 use anyhow::Result;
-use farm_core::farm::{self, FarmModule, SessionId, WorkerEvent};
+use farm_core::farm;
+use farm_core::farm::{
+    Command, Nexus, PartyCommand, PartyCreate, PartyKey, PartyLayout,
+    SessionKey, WorkerEvent,
+};
 use kameo::Actor;
 use kameo::actor::{ActorRef, Spawn};
 use kameo::prelude::{Context, Message};
@@ -14,24 +18,24 @@ use time_check::mini_check;
 pub struct Config {
     /// Bind address for the worker server.
     pub addr: SocketAddr,
-    /// How many sessions must be ready before a party is auto-created.
-    pub party_size: usize,
+    /// Dynamic party layout received from the server.
+    pub layout: PartyLayout,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             addr: SocketAddr::from_str("0.0.0.0:4000").unwrap(),
-            party_size: 4,
+            layout: PartyLayout { map: "de_vertigo".to_string(), party_size: 4 },
         }
     }
 }
 
 pub struct Core {
     config: Config,
-    farm: FarmModule,
+    nexus: ActorRef<Nexus>,
     server: Server,
-    pending_sessions: Vec<SessionId>,
+    pending_sessions: Vec<SessionKey>,
 }
 
 impl Actor for Core {
@@ -44,12 +48,12 @@ impl Actor for Core {
         let recp = actor_ref.clone().recipient();
         let server = Server::new(addr, recp).await?;
 
-        let farm = FarmModule::new(
-            actor_ref.clone().recipient(),
-            actor_ref.clone().recipient(),
-        ).await?;
+        let nexus = Nexus::spawn((
+            actor_ref.clone().recipient::<(WorkerId, worker::Command)>(),
+            actor_ref.clone().recipient::<farm::Event>(),
+        ));
 
-        Ok(Self { config, farm, server, pending_sessions: Vec::new() })
+        Ok(Self { config, nexus, server, pending_sessions: Vec::new() })
     }
 }
 
@@ -100,8 +104,12 @@ impl Core {
         _ctx: &mut Context<Self, ()>,
     ) -> Result<()> {
         match event {
-            server::Event::New(wid, ClientType::Worker) => self.farm.worker_connected(wid).await?,
-            server::Event::Worker(wid, ev) => self.farm.worker_event(wid, ev).await?,
+            server::Event::New(wid, ClientType::Worker) => {
+                self.nexus.ask(Command::Connected(wid)).await?;
+            }
+            server::Event::Worker(wid, ev) => {
+                self.nexus.ask(Command::Worker(wid, ev)).await?;
+            }
             _ => {}
         }
         Ok(())
@@ -117,22 +125,23 @@ impl Core {
 
             farm::Event::SessionReady(sid) => {
                 self.pending_sessions.push(sid);
-                if self.pending_sessions.len() >= self.config.party_size {
-                    let party_size = self.config.party_size;
-                    let sids: Vec<SessionId> =
+                let party_size = self.config.layout.party_size;
+                if self.pending_sessions.len() >= party_size {
+                    let sids: Vec<SessionKey> =
                         self.pending_sessions.drain(..party_size).collect();
-                    let pid = self.farm.create_party().await?;
+                    let pid: PartyKey = self
+                        .nexus
+                        .ask(PartyCreate { layout: self.config.layout.clone() })
+                        .await?;
                     for s in sids {
-                        self.farm.party_add(pid, s).await?;
+                        self.nexus.ask(Command::Party(pid, PartyCommand::Add(s))).await?;
                     }
-                    self.farm.party_start(pid).await?;
+                    self.nexus.ask(Command::Party(pid, PartyCommand::Start)).await?;
                 }
             }
 
             farm::Event::SessionDead(_sid) => {}
-
             farm::Event::PartyRound(_pid) => {}
-
             farm::Event::PartyDone(_pid) => {}
         }
         Ok(())

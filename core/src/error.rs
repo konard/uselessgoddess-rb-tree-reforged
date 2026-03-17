@@ -1,5 +1,5 @@
 use thiserror::Error;
-use crate::ids::{PartyId, SessionId};
+use crate::ids::{PartyKey, SessionKey, WorkerSlot};
 
 /// Domain errors produced by the farm routing core.
 ///
@@ -11,17 +11,17 @@ pub enum Error {
     #[error("worker {0:?} not found")]
     WorkerNotFound(server::WorkerId),
 
-    #[error("slot {slot} not found for worker {wid:?}")]
-    SlotNotFound { wid: server::WorkerId, slot: usize },
+    #[error("slot {slot:?} not found for worker {wid:?}")]
+    SlotNotFound { wid: server::WorkerId, slot: WorkerSlot },
 
     #[error("session {0:?} not found")]
-    SessionNotFound(SessionId),
+    SessionNotFound(SessionKey),
 
     #[error("session {0:?} has no friend code")]
-    NoFriendCode(SessionId),
+    NoFriendCode(SessionKey),
 
     #[error("party {0:?} not found")]
-    PartyNotFound(PartyId),
+    PartyNotFound(PartyKey),
 
     #[error("engine not started")]
     NoEngine,

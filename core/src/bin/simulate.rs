@@ -1,5 +1,8 @@
 use anyhow::Result;
-use farm_core::farm::{self, FarmModule, SessionId};
+use farm_core::farm::{
+    Command, Event, Nexus, PartyCommand, PartyCreate, PartyLayout, SessionCreate, SessionKey,
+};
+use farm_core::ids::WorkerSlot;
 use kameo::actor::{ActorRef, Spawn};
 use kameo::prelude::{Context, Message};
 use protocol::migo::worker::session::{self, game};
@@ -7,19 +10,22 @@ use server::WorkerId;
 use tokio::time::{Duration, sleep};
 
 struct SimSession {
-    sid: SessionId,
+    sid: SessionKey,
     wid: WorkerId,
-    farm: FarmModule,
+    /// Wire slot assigned by the worker registry.
+    slot: WorkerSlot,
+    nexus: ActorRef<Nexus>,
 }
 
 impl SimSession {
     async fn fire(&self, event: session::Event) -> Result<()> {
-        self.farm
-            .worker_event(
+        self.nexus
+            .ask(Command::Worker(
                 self.wid,
-                protocol::migo::worker::Event::Session(self.sid.inner() as usize, event),
-            )
-            .await
+                protocol::migo::worker::Event::Session(self.slot.0, event),
+            ))
+            .await?;
+        Ok(())
     }
 
     async fn fire_running(&self) -> Result<()> {
@@ -46,7 +52,7 @@ impl SimSession {
     async fn fire_game_ready(&self, team: game::Team, round: u32) -> Result<()> {
         self.fire(session::Event::Game(game::Event::StateUpdate {
             sign_on_state: game::SignOnState::Full,
-            player: Some(game::PlayerState { team, name: format!("{:?}", self.sid) }),
+            player: Some(game::PlayerState { team, name: format!("bot-{:?}", self.sid) }),
             map: game::Map::Base { name: "de_vertigo".to_string() },
             match_state: Some(game::MatchState {
                 phase: game::Phase::Round { number: round },
@@ -90,11 +96,11 @@ async fn main() -> Result<()> {
                 Ok(FarmLog)
             }
         }
-        impl Message<farm::Event> for FarmLog {
+        impl Message<Event> for FarmLog {
             type Reply = ();
             async fn handle(
                 &mut self,
-                ev: farm::Event,
+                ev: Event,
                 _: &mut Context<Self, ()>,
             ) -> Self::Reply {
                 println!("[farm] {ev:?}");
@@ -103,18 +109,28 @@ async fn main() -> Result<()> {
         FarmLog::spawn(()).recipient()
     };
 
-    let farm = FarmModule::new(server_recp, farm_recp).await?;
+    let nexus = Nexus::spawn((server_recp, farm_recp));
 
     let wid = WorkerId(1);
-    farm.worker_connected(wid).await?;
+    nexus.ask(Command::Connected(wid)).await?;
     println!("[sim] worker {wid:?} connected");
     sleep(Duration::from_millis(100)).await;
 
+    let layout = PartyLayout { map: "de_vertigo".to_string(), party_size: 4 };
+
+    // Sessions are allocated in order; slot 0 = first session, etc.
     let mut sessions: Vec<SimSession> = Vec::new();
     for i in 0..4usize {
-        let sid = farm.create_session(wid, &format!("player{i}"), "pass", "secret").await?;
-        println!("[sim] session {sid:?} created");
-        let s = SimSession { sid, wid, farm: farm.clone() };
+        let sid: SessionKey = nexus
+            .ask(SessionCreate {
+                wid,
+                username: format!("player{i}"),
+                password: "pass".to_string(),
+                secret: "secret".to_string(),
+            })
+            .await?;
+        println!("[sim] session {sid:?} created (slot {i})");
+        let s = SimSession { sid, wid, slot: WorkerSlot(i), nexus: nexus.clone() };
         s.fire_running().await?;
         s.fire_invite_code(&format!("FC-{i:04X}")).await?;
         sessions.push(s);
@@ -123,13 +139,13 @@ async fn main() -> Result<()> {
 
     sleep(Duration::from_millis(200)).await;
 
-    let pid = farm.create_party().await?;
+    let pid = nexus.ask(PartyCreate { layout }).await?;
     println!("[sim] party {pid:?} created");
 
     for s in &sessions {
-        farm.party_add(pid, s.sid).await?;
+        nexus.ask(Command::Party(pid, PartyCommand::Add(s.sid))).await?;
     }
-    farm.party_start(pid).await?;
+    nexus.ask(Command::Party(pid, PartyCommand::Start)).await?;
     println!("[sim] party started");
 
     sleep(Duration::from_millis(50)).await;
