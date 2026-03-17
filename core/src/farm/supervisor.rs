@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use kameo::Actor;
 use kameo::actor::{ActorRef, Recipient};
 use kameo::prelude::{Context, Message};
@@ -9,7 +9,8 @@ use protocol::migo::worker::session::{self, User, game};
 use server::WorkerId;
 
 use super::party::{self, Party};
-use crate::ids::{IdGen, PartyId, SessionId};
+use crate::error::Error;
+use crate::prelude::*;
 
 struct Worker {
     sessions: Vec<SessionId>,
@@ -29,7 +30,6 @@ impl Worker {
     fn lookup(&self, slot: usize) -> Option<SessionId> {
         self.sessions.get(slot).copied()
     }
-
 }
 
 pub struct SessionCreate {
@@ -75,6 +75,12 @@ pub enum Command {
     Party(PartyId, PartyCommand),
 }
 
+/// Core routing actor for the CS2 farm panel.
+///
+/// `Ratchet` sits between the server (which talks to workers) and the
+/// party logic.  It maintains the authoritative maps of
+/// workers → sessions and sessions → parties, and routes every
+/// incoming worker event or outgoing session command to the right place.
 pub struct Ratchet {
     parent: Recipient<Event>,
     server: Recipient<(WorkerId, worker::Command)>,
@@ -113,71 +119,60 @@ impl Message<(PartyId, party::Event)> for Ratchet {
         (pid, event): (PartyId, party::Event),
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let result = match event {
-            party::Event::Session(sid, cmd) => {
-                self.sessions
-                    .get(&sid)
-                    .ok_or_else(|| anyhow::anyhow!("session {sid:?} not found"))
-                    .and_then(|rec| {
-                        let command = worker::Command::Session(rec.slot, cmd);
-                        self.server.tell((rec.wid, command)).try_send()?;
-                        Ok(())
-                    })
+        let result: crate::error::Result = match event {
+            party::Event::Session(sid, cmd) => self.route_session_cmd(sid, cmd),
+            party::Event::RoundComplete => {
+                self.parent.tell(Event::PartyRound(pid)).await.map_err(|e| Error::Send(e.into()))
             }
-            party::Event::RoundComplete => self.parent.tell(Event::PartyRound(pid)).await.map_err(Into::into),
             party::Event::Done => {
                 self.parties.remove(&pid);
-                self.parent.tell(Event::PartyDone(pid)).await.map_err(Into::into)
+                self.parent.tell(Event::PartyDone(pid)).await.map_err(|e| Error::Send(e.into()))
             }
         };
         if let Err(e) = result {
-            eprintln!("Err: {}", e);
+            eprintln!("[ratchet] {e}");
         }
     }
 }
 
 impl Message<Command> for Ratchet {
-    type Reply = Result<()>;
+    type Reply = crate::error::Result;
 
-    async fn handle(&mut self, cmd: Command, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
+    async fn handle(
+        &mut self,
+        cmd: Command,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
         match cmd {
             Command::Connected(wid) => {
                 self.workers.insert(wid, Worker::new());
-                self.parent.tell(Event::Worker(wid, WorkerEvent::New)).await?;
+                self.parent
+                    .tell(Event::Worker(wid, WorkerEvent::New))
+                    .await
+                    .map_err(|e| Error::Send(e.into()))?;
             }
 
             Command::Worker(wid, worker::Event::Session(slot, ev)) => {
-                let Some(worker) = self.workers.get(&wid) else {
-                    bail!("Worker {:?} not found", wid);
-                };
-                let Some(sid) = worker.lookup(slot) else {
-                    bail!("Slot {} not found for worker {:?}", slot, wid);
-                };
+                let worker = self.workers.get(&wid).ok_or(Error::WorkerNotFound(wid))?;
+                let sid = worker.lookup(slot).ok_or(Error::SlotNotFound { wid, slot })?;
                 self.handle_session(sid, ev, ctx).await?;
             }
 
             Command::Party(pid, PartyCommand::Add(sid)) => {
-                let Some(party) = self.parties.get(&pid) else {
-                    bail!("Party {:?} not found", pid);
+                let party = self.parties.get(&pid).ok_or(Error::PartyNotFound(pid))?;
+                let code = {
+                    let sess =
+                        self.sessions.get_mut(&sid).ok_or(Error::SessionNotFound(sid))?;
+                    let code = sess.friend_code.clone().ok_or(Error::NoFriendCode(sid))?;
+                    sess.party_id = Some(pid);
+                    code
                 };
-
-                let Some(sess) = self.sessions.get_mut(&sid) else {
-                    bail!("Session {:?} not found", sid);
-                };
-
-                let Some(code) = sess.friend_code.clone() else {
-                    bail!("Session {:?} has no friend code", sid);
-                };
-
-                sess.party_id = Some(pid);
-                party.create(sid, &code).await?;
+                party.create(sid, &code).await.map_err(Error::from)?;
             }
 
             Command::Party(pid, PartyCommand::Start) => {
-                let Some(party) = self.parties.get(&pid) else {
-                    bail!("Party {:?} not found", pid);
-                };
-                party.start().await?;
+                let party = self.parties.get(&pid).ok_or(Error::PartyNotFound(pid))?;
+                party.start().await.map_err(Error::from)?;
             }
         }
         Ok(())
@@ -185,16 +180,14 @@ impl Message<Command> for Ratchet {
 }
 
 impl Message<SessionCreate> for Ratchet {
-    type Reply = Result<SessionId>;
+    type Reply = crate::error::Result<SessionId>;
 
     async fn handle(
         &mut self,
         SessionCreate { wid, username, password, secret }: SessionCreate,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let Some(worker) = self.workers.get_mut(&wid) else {
-            bail!("Worker {:?} not found", wid);
-        };
+        let worker = self.workers.get_mut(&wid).ok_or(Error::WorkerNotFound(wid))?;
 
         let sid = self.session_gen.next();
         let slot = worker.alloc(sid);
@@ -203,14 +196,17 @@ impl Message<SessionCreate> for Ratchet {
         self.sessions.insert(sid, SessionRecord { wid, slot, party_id: None, friend_code: None });
 
         let command = worker::Command::Session(slot, session::Command::Create { user });
-        self.server.tell((wid, command)).try_send()?;
+        self.server
+            .tell((wid, command))
+            .try_send()
+            .map_err(|e| Error::Send(e.into()))?;
 
         Ok(sid)
     }
 }
 
 impl Message<PartyCreate> for Ratchet {
-    type Reply = Result<PartyId>;
+    type Reply = crate::error::Result<PartyId>;
 
     async fn handle(
         &mut self,
@@ -220,7 +216,7 @@ impl Message<PartyCreate> for Ratchet {
         let pid = self.party_gen.next();
         let recp = ctx.actor_ref().clone().recipient();
 
-        let party = Party::new(pid, recp).await?;
+        let party = Party::new(pid, recp).await.map_err(Error::from)?;
         self.parties.insert(pid, party);
 
         Ok(pid)
@@ -228,19 +224,31 @@ impl Message<PartyCreate> for Ratchet {
 }
 
 impl Ratchet {
+    /// Route a session command to the correct worker slot.
+    fn route_session_cmd(
+        &self,
+        sid: SessionId,
+        cmd: session::Command,
+    ) -> crate::error::Result {
+        let rec = self.sessions.get(&sid).ok_or(Error::SessionNotFound(sid))?;
+        let command = worker::Command::Session(rec.slot, cmd);
+        self.server.tell((rec.wid, command)).try_send().map_err(|e| Error::Send(e.into()))
+    }
+
     async fn handle_session(
         &mut self,
         sid: SessionId,
         event: session::Event,
-        _: &mut Context<Self, Result<()>>,
-    ) -> Result<()> {
-        let Some(sess) = self.sessions.get_mut(&sid) else {
-            bail!("Session {:?} not found", sid);
-        };
+        _: &mut Context<Self, crate::error::Result>,
+    ) -> crate::error::Result {
+        let sess = self.sessions.get_mut(&sid).ok_or(Error::SessionNotFound(sid))?;
 
         match &event {
             session::Event::StateUpdate(session::State::Running) => {
-                self.parent.tell(Event::SessionReady(sid)).await?;
+                self.parent
+                    .tell(Event::SessionReady(sid))
+                    .await
+                    .map_err(|e| Error::Send(e.into()))?;
             }
 
             session::Event::Game(game::Event::InviteCodeUpdate { code }) => {
@@ -258,11 +266,10 @@ impl Ratchet {
             return Ok(());
         };
 
-        party.send_member(sid, event).await?;
-        Ok(())
+        party.send_member(sid, event).await.map_err(Error::from)
     }
 
-    pub async fn on_worker_dead(&mut self, wid: WorkerId) -> Result<()> {
+    pub async fn on_worker_dead(&mut self, wid: WorkerId) -> crate::error::Result {
         let dead: Vec<SessionId> = self
             .sessions
             .iter()
@@ -276,7 +283,7 @@ impl Ratchet {
         Ok(())
     }
 
-    pub async fn on_session_dead(&mut self, sid: SessionId) -> Result<()> {
+    pub async fn on_session_dead(&mut self, sid: SessionId) -> crate::error::Result {
         if let Some(rec) = self.sessions.get(&sid)
             && let Some(pid) = rec.party_id
             && let Some(party) = self.parties.get(&pid)
@@ -284,7 +291,10 @@ impl Ratchet {
             let _ = party.member_dead(sid).await;
         }
         self.sessions.remove(&sid);
-        self.parent.tell(Event::SessionDead(sid)).await?;
+        self.parent
+            .tell(Event::SessionDead(sid))
+            .await
+            .map_err(|e| Error::Send(e.into()))?;
         Ok(())
     }
 }

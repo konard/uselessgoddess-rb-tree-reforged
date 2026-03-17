@@ -10,6 +10,7 @@ name = "farm_core"
 anyhow     = { workspace = true }
 kameo      = { workspace = true }
 tokio      = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "sync", "signal", "time"] }
+thiserror  = "2"
 bimap      = "0.6"
 indexmap   = "2"
 rand       = "0.8"

@@ -10,20 +10,36 @@ use protocol::migo::{ClientType, worker};
 use server::{Server, WorkerId};
 use time_check::mini_check;
 
-const PARTY_SIZE: usize = 4;
+/// Runtime configuration for the farm core.
+pub struct Config {
+    /// Bind address for the worker server.
+    pub addr: SocketAddr,
+    /// How many sessions must be ready before a party is auto-created.
+    pub party_size: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            addr: SocketAddr::from_str("0.0.0.0:4000").unwrap(),
+            party_size: 4,
+        }
+    }
+}
 
 pub struct Core {
+    config: Config,
     farm: FarmModule,
     server: Server,
     pending_sessions: Vec<SessionId>,
 }
 
 impl Actor for Core {
-    type Args = ();
+    type Args = Config;
     type Error = anyhow::Error;
 
-    async fn on_start(_: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        let addr = SocketAddr::from_str("0.0.0.0:4000")?;
+    async fn on_start(config: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
+        let addr = config.addr;
 
         let recp = actor_ref.clone().recipient();
         let server = Server::new(addr, recp).await?;
@@ -33,7 +49,7 @@ impl Actor for Core {
             actor_ref.clone().recipient(),
         ).await?;
 
-        Ok(Self { farm, server, pending_sessions: Vec::new() })
+        Ok(Self { config, farm, server, pending_sessions: Vec::new() })
     }
 }
 
@@ -101,9 +117,10 @@ impl Core {
 
             farm::Event::SessionReady(sid) => {
                 self.pending_sessions.push(sid);
-                if self.pending_sessions.len() >= PARTY_SIZE {
+                if self.pending_sessions.len() >= self.config.party_size {
+                    let party_size = self.config.party_size;
                     let sids: Vec<SessionId> =
-                        self.pending_sessions.drain(..PARTY_SIZE).collect();
+                        self.pending_sessions.drain(..party_size).collect();
                     let pid = self.farm.create_party().await?;
                     for s in sids {
                         self.farm.party_add(pid, s).await?;
@@ -126,7 +143,7 @@ impl Core {
 async fn main() -> Result<()> {
     mini_check().await?;
 
-    let core_ref = Core::spawn(());
+    let core_ref = Core::spawn(Config::default());
     core_ref.wait_for_startup().await;
 
     tokio::signal::ctrl_c().await?;

@@ -1,4 +1,3 @@
-use anyhow::{Result, bail};
 use bimap::BiMap;
 use indexmap::IndexMap;
 use kameo::Actor;
@@ -13,7 +12,8 @@ use protocol::migo::worker::session::{self};
 use std::time::Duration;
 use tokio::time::sleep;
 
-use crate::ids::{GroupId, IdGen, PartyId, SessionId};
+use crate::error::Error;
+use crate::prelude::*;
 
 pub struct MemberCreate {
     pub sid: SessionId,
@@ -75,6 +75,8 @@ pub struct PartyActor {
 
     group_gen: IdGen<crate::ids::GroupTag>,
 
+    // IndexMap preserves insertion order, which guarantees a deterministic
+    // master selection (first inserted session = master of the group).
     members: IndexMap<SessionId, Member>,
     groups: IndexMap<GroupId, Group>,
 
@@ -85,7 +87,7 @@ impl Actor for PartyActor {
     type Args = (PartyId, Recipient<(PartyId, Event)>);
     type Error = anyhow::Error;
 
-    async fn on_start(args: Self::Args, _: ActorRef<Self>) -> Result<Self, Self::Error> {
+    async fn on_start(args: Self::Args, _: ActorRef<Self>) -> anyhow::Result<Self, anyhow::Error> {
         let (pid, parent) = args;
         Ok(Self {
             pid,
@@ -101,7 +103,7 @@ impl Actor for PartyActor {
 }
 
 impl Message<Command> for PartyActor {
-    type Reply = Result<()>;
+    type Reply = crate::error::Result;
 
     async fn handle(&mut self, cmd: Command, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         match cmd {
@@ -117,7 +119,7 @@ impl Message<Command> for PartyActor {
 }
 
 impl Message<MemberCreate> for PartyActor {
-    type Reply = Result<()>;
+    type Reply = crate::error::Result;
 
     async fn handle(
         &mut self,
@@ -138,7 +140,7 @@ impl Message<MemberCreate> for PartyActor {
 }
 
 impl PartyActor {
-    async fn start_party(&mut self, _ctx: &mut Context<Self, Result<()>>) -> Result<()> {
+    async fn start_party(&mut self, _ctx: &mut Context<Self, crate::error::Result>) -> crate::error::Result {
         let ids: Vec<SessionId> = self.members.keys().cloned().collect();
 
         let gid = self.group_gen.next();
@@ -171,7 +173,10 @@ impl PartyActor {
         Ok(())
     }
 
-    async fn send_accept_match(&mut self, ctx: &mut Context<Self, Result<()>>) -> Result<()> {
+    async fn send_accept_match(
+        &mut self,
+        _ctx: &mut Context<Self, crate::error::Result>,
+    ) -> crate::error::Result {
         let accept_task = InMenuTask { total: 1, next_sync: SyncPoint::GameLoading };
         for member in self.members.values_mut() {
             member.menu_task = Some(accept_task.clone());
@@ -190,7 +195,6 @@ impl PartyActor {
         }
 
         self.clear_sync();
-        let _ = ctx;
         Ok(())
     }
 }
@@ -204,7 +208,7 @@ impl Message<engine::Event> for PartyActor {
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         if let Err(e) = self.handle_engine(event, ctx).await {
-            eprintln!("Err: {}", e);
+            eprintln!("[party] {e}");
         }
     }
 }
@@ -214,7 +218,7 @@ impl PartyActor {
         &mut self,
         event: engine::Event,
         ctx: &mut Context<Self, ()>,
-    ) -> Result<()> {
+    ) -> crate::error::Result {
         match event {
             engine::Event::Bot(id, BotEvent::Progress(prog)) => {
                 println!("{:?} {:?}", id, prog);
@@ -229,12 +233,15 @@ impl PartyActor {
         Ok(())
     }
 
-    async fn send_event(&self, event: Event) -> Result<()> {
-        Ok(self.parent.tell((self.pid, event)).await?)
+    async fn send_event(&self, event: Event) -> crate::error::Result {
+        self.parent
+            .tell((self.pid, event))
+            .await
+            .map_err(|e| Error::Send(e.into()))
     }
 
-    async fn send_session(&self, sid: SessionId, cmd: session::Command) -> Result<()> {
-        Ok(self.send_event(Event::Session(sid, cmd)).await?)
+    async fn send_session(&self, sid: SessionId, cmd: session::Command) -> crate::error::Result {
+        self.send_event(Event::Session(sid, cmd)).await
     }
 
     async fn handle_cbot(
@@ -242,11 +249,12 @@ impl PartyActor {
         id: BotId,
         event: CBotEvent,
         _: &mut Context<Self, ()>,
-    ) -> Result<()> {
-        let Some(sid) = self.bot_to_session.get_by_left(&id).cloned() else {
-            println!("{:?}, not found", id);
-            return Ok(());
-        };
+    ) -> crate::error::Result {
+        let sid = self
+            .bot_to_session
+            .get_by_left(&id)
+            .cloned()
+            .ok_or(Error::BotNotFound(id))?;
 
         match event {
             CBotEvent::SetTasks { tasks, offset } => {
@@ -274,11 +282,9 @@ impl PartyActor {
         &mut self,
         sid: SessionId,
         event: session::Event,
-        ctx: &mut Context<Self, Result<()>>,
-    ) -> Result<()> {
-        let Some(member) = self.members.get_mut(&sid) else {
-            bail!("Session {:?} not found", sid);
-        };
+        ctx: &mut Context<Self, crate::error::Result>,
+    ) -> crate::error::Result {
+        let member = self.members.get_mut(&sid).ok_or(Error::SessionNotFound(sid))?;
 
         match event {
             session::Event::Game(game::Event::InviteReceived) => {
@@ -316,13 +322,13 @@ impl PartyActor {
             }
 
             session::Event::Game(game::Event::BotTaskCompleted { id }) => {
-                let Some(bot_id) = self.bot_to_session.get_by_right(&sid).cloned() else {
-                    bail!("{:?}, not found", sid);
-                };
-                let Some(engine) = &self.engine else {
-                    bail!("No engine");
-                };
-                engine.task_completed(bot_id, id).await?;
+                let bot_id = self
+                    .bot_to_session
+                    .get_by_right(&sid)
+                    .cloned()
+                    .ok_or(Error::SessionNotFound(sid))?;
+                let engine = self.engine.as_ref().ok_or(Error::NoEngine)?;
+                engine.task_completed(bot_id, id).await.map_err(Error::from)?;
             }
 
             session::Event::Game(game::Event::MenuTaskCompleted { id }) => {
@@ -366,7 +372,10 @@ impl PartyActor {
         self.members.values().all(|m| m.sync_epoch == epoch && &m.sync == point)
     }
 
-    async fn sync_update(&mut self, ctx: &mut Context<Self, Result<()>>) -> Result<()> {
+    async fn sync_update(
+        &mut self,
+        ctx: &mut Context<Self, crate::error::Result>,
+    ) -> crate::error::Result {
         let epoch = self.current_epoch();
 
         if self.all_at(epoch, &SyncPoint::Ready) {
@@ -381,7 +390,10 @@ impl PartyActor {
         Ok(())
     }
 
-    async fn on_all_ready(&mut self, _ctx: &mut Context<Self, Result<()>>) -> Result<()> {
+    async fn on_all_ready(
+        &mut self,
+        _ctx: &mut Context<Self, crate::error::Result>,
+    ) -> crate::error::Result {
         for (_gid, group) in &self.groups {
             if let Some(master) = self.members.get_mut(&group.master) {
                 master.sync = SyncPoint::Lobby;
@@ -408,7 +420,10 @@ impl PartyActor {
         Ok(())
     }
 
-    async fn on_all_recv_match(&mut self, ctx: &mut Context<Self, Result<()>>) -> Result<()> {
+    async fn on_all_recv_match(
+        &mut self,
+        ctx: &mut Context<Self, crate::error::Result>,
+    ) -> crate::error::Result {
         let match_ids: Vec<_> = self.groups.values().filter_map(|g| g.match_id).collect();
         if !match_ids.windows(2).all(|w| w[0] == w[1]) {
             println!("match_id mismatch across groups: {:?}", match_ids);
@@ -425,11 +440,14 @@ impl PartyActor {
         Ok(())
     }
 
-    async fn on_all_game_ready(&mut self, ctx: &mut Context<Self, Result<()>>) -> Result<()> {
+    async fn on_all_game_ready(
+        &mut self,
+        ctx: &mut Context<Self, crate::error::Result>,
+    ) -> crate::error::Result {
         self.round += 1;
 
         let recp = ctx.actor_ref().clone().recipient();
-        let engine = Engine::new(recp).await?;
+        let engine = Engine::new(recp).await.map_err(Error::from)?;
 
         for (sid, member) in self.members.iter_mut() {
             let (Some(team), Some(name)) = (&member.team, &member.name) else {
@@ -437,12 +455,12 @@ impl PartyActor {
             };
 
             if matches!(team, Team::CounterTerrorists | Team::Terrorists) {
-                let bid = engine.create(name, team.clone()).await?;
+                let bid = engine.create(name, team.clone()).await.map_err(Error::from)?;
                 self.bot_to_session.insert(bid, *sid);
             }
         }
 
-        engine.start().await?;
+        engine.start().await.map_err(Error::from)?;
         self.engine = Some(engine);
 
         self.clear_sync();
